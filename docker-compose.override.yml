@@ -1,0 +1,29 @@
+# Local development overrides. Merged automatically by `docker compose up`.
+# Never copied to servers: deploys pass explicit -f flags.
+services:
+  db:
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+
+  migrate:
+    build:
+      target: dev
+
+  api:
+    build:
+      target: dev
+    environment:
+      NODE_ENV: development
+      LOG_LEVEL: debug
+      LOG_PRETTY: "true"
+    volumes:
+      - ./api/src:/app/src:ro          # node --watch restarts on change
+      - ./api/migrations:/app/migrations:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  web:
+    volumes:
+      - ./web/public:/usr/share/nginx/html:ro   # edit HTML/JS/CSS live
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"

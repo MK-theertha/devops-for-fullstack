@@ -1,0 +1,61 @@
+name: Deploy
+
+on:
+  # Every green CI run on main ships to staging, then waits for approval
+  # (GitHub Environment protection rule) before production.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Manual deploys and rollbacks: pick an environment and any previously built SHA.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        required: true
+      image_tag:
+        description: Image tag to deploy (full git SHA)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ inputs.image_tag || github.event.workflow_run.head_sha }}
+        run: |
+          [[ "$TAG" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::image_tag must be a full git SHA"; exit 1; }
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  staging:
+    needs: resolve
+    if: github.event_name == 'workflow_run' || inputs.environment == 'staging'
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: staging
+      image_tag: ${{ needs.resolve.outputs.image_tag }}
+    secrets: inherit
+
+  production:
+    needs: [resolve, staging]
+    # Automatic path: only after staging succeeded. Manual path: staging is skipped.
+    if: >-
+      always() && needs.resolve.result == 'success' && (
+        (github.event_name == 'workflow_run' && needs.staging.result == 'success') ||
+        inputs.environment == 'production'
+      )
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      environment: production
+      image_tag: ${{ needs.resolve.outputs.image_tag }}
+    secrets: inherit

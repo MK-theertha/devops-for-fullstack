@@ -1,0 +1,113 @@
+# Reusable deploy job. Per-environment configuration lives in the GitHub
+# Environment (Settings → Environments → staging / production):
+#
+#   vars:    DEPLOY_HOST, DEPLOY_USER, DOMAIN, LOG_LEVEL (optional)
+#   secrets: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, GHCR_READ_TOKEN,
+#            POSTGRES_PASSWORD, GRAFANA_ADMIN_PASSWORD
+name: _deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image_tag:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://${{ vars.DOMAIN }}
+    # Never run two deploys to the same environment at once; never cancel one mid-flight.
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      APP_DIR: /opt/notes
+      SSH_TARGET: ${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}
+    steps:
+      # Check out the same commit as the image so compose files match the code.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.image_tag }}
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # Secrets flow GitHub Environment -> step env -> file with mode 600 on the
+      # host. They never appear in the image, the repo, or command-line args.
+      - name: Render environment file
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL || 'info' }}
+        run: |
+          umask 077
+          {
+            echo "REGISTRY=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "POSTGRES_DB=notes"
+            echo "POSTGRES_USER=notes"
+            echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "LOG_LEVEL=$LOG_LEVEL"
+            echo "DOMAIN=$DOMAIN"
+            echo "GRAFANA_ADMIN_PASSWORD=$GRAFANA_ADMIN_PASSWORD"
+          } > deploy.env
+
+      - name: Upload stack definition
+        run: |
+          ssh "$SSH_TARGET" "mkdir -p $APP_DIR"
+          rsync -az --delete-after --relative \
+            docker-compose.yml docker-compose.prod.yml docker-compose.monitoring.yml \
+            deploy/ monitoring/ scripts/ \
+            "$SSH_TARGET:$APP_DIR/"
+          rsync -a --chmod=F600 deploy.env "$SSH_TARGET:$APP_DIR/.env"
+
+      - name: Registry login on host
+        env:
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_READ_TOKEN" | \
+            ssh "$SSH_TARGET" "docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin"
+
+      - name: Deploy (auto-rolls back if health checks fail)
+        id: deploy
+        run: ssh "$SSH_TARGET" "$APP_DIR/scripts/deploy.sh $IMAGE_TAG"
+
+      # End-to-end check through DNS, TLS, Caddy, nginx and the API, asserting
+      # the new version is what's actually serving traffic.
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 12); do
+            version=$(curl -fsS "https://${{ vars.DOMAIN }}/api/health" | jq -r .version) || true
+            [[ "$version" == "$IMAGE_TAG" ]] && { echo "Serving $version"; exit 0; }
+            echo "attempt $i: got '${version:-no response}', waiting..."; sleep 5
+          done
+          echo "::error::Smoke test failed: expected version $IMAGE_TAG"
+          exit 1
+
+      - name: Roll back after failed smoke test
+        if: failure() && steps.deploy.outcome == 'success'
+        run: ssh "$SSH_TARGET" "$APP_DIR/scripts/deploy.sh --rollback"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.environment }}: ${{ job.status }}"
+            echo "- Image tag: \`$IMAGE_TAG\`"
+            echo "- URL: https://${{ vars.DOMAIN }}"
+          } >> "$GITHUB_STEP_SUMMARY"

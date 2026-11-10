@@ -1,0 +1,57 @@
+# Production/staging overrides. Images are pulled from the registry by tag;
+# nothing is built on the server.
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  db:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1g }
+
+  migrate:
+    <<: *hardening
+    restart: "no"
+
+  api:
+    <<: *hardening
+    read_only: true
+    tmpfs: [/tmp]
+    deploy:
+      replicas: 2   # nginx re-resolves "api" per request, so both get traffic
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+
+  web:
+    <<: *hardening
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64m }
+
+  # TLS termination with automatic Let's Encrypt certificates.
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      web: { condition: service_healthy }
+    networks: [frontend]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  caddy-data:
+  caddy-config:
